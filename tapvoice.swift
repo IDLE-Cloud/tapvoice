@@ -1,33 +1,49 @@
 #!/usr/bin/env swift
-// tapvoice — macOS daemon: four-finger tap -> key event.
-// Reads raw trackpad frames via the private MultitouchSupport framework
-// (no permission needed for capture), detects a four-finger tap, then posts
-// a key at the HID level via CGEvent (requires Accessibility permission).
+// tapvoice — macOS 触控板手势 → 按键事件 的开源守护进程（Swift，无依赖）
 //
-// Gestures:
-//   four-finger tap          -> left-Cmd (toggle: e.g. Doubao voice input)
-//   four-finger double-tap   -> Return
-// Single taps are delayed 280ms to wait for a possible second tap; a
-// double-tap only sends Return and never touches the voice state.
+// 手势（默认）：
+//   N指轻点                → 自定义键（默认 4 指 → 左⌘，立即触发）
+//   M指双击(<450ms)        → 自定义键（默认 3 指 → 回车；M≠N 避免误触）
 //
-// Env: TAP_FINGERS (default 4), TAP_DEBUG=1 logs every contact frame.
+// 实现：MultitouchSupport 私有框架读原始触点帧（无需权限）→ 指数量+时间窗判定
+//       → CGEvent 系统级发键（此步需辅助功能权限）
+//
+// 判定要点：
+//   - 触点帧在落指/抬指时必然波动(如 4→3→2→4→3→1)，过渡帧不取消候选，count==0 才判决
+//   - M指双击的接触需持续 ≥60ms 且总时长 <300ms（区分为拖移类长接触与过渡噪声）
+//
+// 配置（环境变量）：
+//   TAP_FINGERS       单击触发指数量，默认 4
+//   TAP_KEYCODE       单击键码，默认 55（左⌘）
+//   TAP_FLAGS         单击修饰标志(hex)，默认 0x100008（⌘ + 左键设备标记）
+//   DOUBLE_FINGERS    双击触发指数量，默认 3
+//   DOUBLE_KEYCODE    双击键码，默认 36（回车）
+//   TAP_DEBUG=1       记录所有触点帧
 import Foundation
 import CoreGraphics
 import ApplicationServices
 
-let MT_PATH = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/Current/MultitouchSupport"
-let wantedFingers = Int(ProcessInfo.processInfo.environment["TAP_FINGERS"] ?? "4") ?? 4
-let debugMode = ProcessInfo.processInfo.environment["TAP_DEBUG"] == "1"
+let env = ProcessInfo.processInfo.environment
+let wantedFingers = Int(env["TAP_FINGERS"] ?? "4") ?? 4
+let tapKeycode = UInt16(env["TAP_KEYCODE"] ?? "55") ?? 55
+let tapFlags = CGEventFlags(rawValue: UInt64(env["TAP_FLAGS"] ?? "0x100008") ?? 0x100008)
+let doubleFingers = Int(env["DOUBLE_FINGERS"] ?? "3") ?? 3
+let doubleKeycode = UInt16(env["DOUBLE_KEYCODE"] ?? "36") ?? 36
+let debugMode = env["TAP_DEBUG"] == "1"
 let logFH = FileHandle.standardOutput
 func log(_ s: String) { logFH.write((s + "\n").data(using: .utf8)!) }
 
 typealias MTDevice = UnsafeMutableRawPointer
 typealias MTContactFrameCallback = @convention(c) (MTDevice?, UnsafeRawPointer?, Int, Double, UInt32) -> Void
 
+// 单击候选（wantedFingers 指）
 var tapStart: Date?
 var lastFire = Date.distantPast
-var lastTapDate = Date.distantPast
-var pendingGeneration = 0
+// 双击候选（doubleFingers 指，需持续接触，两次 <450ms）
+var bClusterStart: Date?
+var bFirstThree: Date?
+var bLastThree: Date?
+var lastBTap = Date.distantPast
 let stateLock = NSLock()
 var deviceIndex: [UnsafeMutableRawPointer: Int] = [:]
 
@@ -42,13 +58,6 @@ func postKey(_ keycode: UInt16, _ flags: CGEventFlags) {
     up?.post(tap: .cghidEventTap)
 }
 
-func postLeftCommand() {
-    // NX_DEVICELCMDKEYMASK = 0x8: mark as *left* Command
-    postKey(55, [.maskCommand, CGEventFlags(rawValue: 0x8)])
-}
-
-// 单击延迟由回调内联处理(回调已持锁, 不得再取同一把锁)
-
 let callback: MTContactFrameCallback = { device, touches, count, timestamp, frame in
     stateLock.lock()
     defer { stateLock.unlock() }
@@ -57,55 +66,59 @@ let callback: MTContactFrameCallback = { device, touches, count, timestamp, fram
     if debugMode && count > 0 {
         log(String(format: "frame: dev=%d count=%d t=%.3f", idx, count, timestamp))
     }
-    if count >= wantedFingers + 1 {
-        // 5+ fingers: palm / five-finger gesture -> cancel
-        tapStart = nil
+
+    // —— 双击族（doubleFingers）：要求持续接触；被更高指数量打断则作废 ——
+    if count == doubleFingers {
+        if bClusterStart == nil {
+            bClusterStart = now
+            bFirstThree = now
+        }
+        bLastThree = now
     } else if count >= wantedFingers {
-        if tapStart == nil { tapStart = now }
-    } else if count > 0 {
-        // 1..(wanted-1) fingers: touchdown/liftoff transition frames -> keep candidate
-    } else {
-        // count == 0: all fingers up, decide now
-        if let t0 = tapStart {
-            let dt = now.timeIntervalSince(t0)
-            tapStart = nil
-            // tap window 30~500ms (covers staggered touchdown); 250ms anti-chatter
-            if dt > 0.03 && dt < 0.5 && now.timeIntervalSince(lastFire) > 0.25 {
-                lastFire = now
-                if now.timeIntervalSince(lastTapDate) < 0.45 {
-                    // double-tap: Return only; cancel the pending single tap
-                    lastTapDate = .distantPast
-                    pendingGeneration += 1
-                    log(String(format: "double-tap (%.0fms) -> post return", dt * 1000))
-                    postKey(36, [])
+        bClusterStart = nil; bFirstThree = nil; bLastThree = nil
+    } else if count == 0 {
+        if let c0 = bClusterStart, let f3 = bFirstThree, let l3 = bLastThree {
+            let total = now.timeIntervalSince(c0)
+            let sustained = l3.timeIntervalSince(f3)
+            // 持续 60ms 以上(排除过渡噪声) 且总时长 <300ms(排除拖移)
+            if total < 0.3 && sustained >= 0.06 {
+                if now.timeIntervalSince(lastBTap) < 0.45 {
+                    lastBTap = .distantPast
+                    log(String(format: "%d-finger double-tap (%.0fms) -> post key %d", doubleFingers, total * 1000, doubleKeycode))
+                    postKey(doubleKeycode, [])
                 } else {
-                    // single tap: fire after 280ms unless a second tap arrives
-                    lastTapDate = now
-                    pendingGeneration += 1
-                    let gen = pendingGeneration
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
-                        stateLock.lock()
-                        let stillPending = (gen == pendingGeneration)
-                        stateLock.unlock()
-                        if stillPending {
-                            log("single-tap (delayed) -> post left-cmd")
-                            postLeftCommand()
-                        }
-                    }
+                    lastBTap = now
                 }
             }
         }
+        bClusterStart = nil; bFirstThree = nil; bLastThree = nil
     }
+
+    // —— 单击族（wantedFingers 指）：过渡帧保留候选，count==0 立即触发 ——
+    if count >= wantedFingers {
+        if tapStart == nil { tapStart = now }
+    } else if count == 0 {
+        if let t0 = tapStart {
+            let dt = now.timeIntervalSince(t0)
+            tapStart = nil
+            // 窗口 30~500ms；防抖动 250ms
+            if dt > 0.03 && dt < 0.5 && now.timeIntervalSince(lastFire) > 0.25 {
+                lastFire = now
+                log(String(format: "%d-finger tap (%.0fms) -> post key %d", wantedFingers, dt * 1000, tapKeycode))
+                postKey(tapKeycode, tapFlags)
+            }
+        }
+    }
+    // 1..(wanted-1) 的过渡帧：不处理（保留单击候选）
 }
 
-guard let mt = dlopen(MT_PATH, RTLD_NOW) else {
+guard let mt = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/Current/MultitouchSupport", RTLD_NOW) else {
     log("FATAL: cannot load MultitouchSupport.framework")
     exit(1)
 }
 typealias CreateListFn = @convention(c) () -> Unmanaged<CFArray>?
 typealias RegCbFn = @convention(c) (MTDevice, MTContactFrameCallback) -> Void
 typealias StartFn = @convention(c) (MTDevice, Int32) -> Int32
-typealias TypeIDFn = @convention(c) (MTDevice) -> Int32
 
 guard let createListSym = dlsym(mt, "MTDeviceCreateList"),
       let regCbSym = dlsym(mt, "MTRegisterContactFrameCallback"),
@@ -116,7 +129,6 @@ guard let createListSym = dlsym(mt, "MTDeviceCreateList"),
 let createList = unsafeBitCast(createListSym, to: CreateListFn.self)
 let regCb = unsafeBitCast(regCbSym, to: RegCbFn.self)
 let startDev = unsafeBitCast(startSym, to: StartFn.self)
-let typeIDFn = dlsym(mt, "MTDeviceGetDeviceTypeID").map { unsafeBitCast($0, to: TypeIDFn.self) }
 
 guard let devicesRef = createList()?.takeUnretainedValue() else {
     log("FATAL: no multitouch devices")
@@ -127,14 +139,12 @@ for (i, dev) in devices.enumerated() {
     deviceIndex[dev] = i
     regCb(dev, callback)
     let rc = startDev(dev, 0)
-    let tid = typeIDFn?(dev) ?? -1
-    log(String(format: "device %d started rc=%d typeID=%d", i, rc, tid))
+    log(String(format: "device %d started rc=%d", i, rc))
 }
-log("tapvoice listening on \(devices.count) device(s), want \(wantedFingers) fingers")
+log("tapvoice listening: tap=\(wantedFingers)fingers key=\(tapKeycode), double=\(doubleFingers)fingers key=\(doubleKeycode)")
 
 // 启动自检: 合成按键需要辅助功能权限; 没有则弹系统授权框
 let trustedOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-let trusted = AXIsProcessTrustedWithOptions(trustedOpts)
-log("accessibility trusted: \(trusted)")
+log("accessibility trusted: \(AXIsProcessTrustedWithOptions(trustedOpts))")
 
 dispatchMain()
