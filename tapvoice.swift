@@ -2,8 +2,9 @@
 // tapvoice — macOS 触控板手势 → 按键事件 的开源守护进程（Swift，无依赖）
 //
 // 手势（默认）：
-//   N指轻点                → 自定义键（默认 4 指 → 左⌘，立即触发）
+//   N指轻点                → 自定义键（默认 4 指 → ⌃⌘ 语音，武装 450ms 等双击判定）
 //   M指双击(<450ms)        → 自定义键（默认 3 指 → 回车；M≠N 避免误触）
+//   N指双击                → ⌘H 隐藏窗口（默认 4 指双击；第一击挂起语音）
 //   2指双击(<450ms)        → 删除键（默认退格 51；位移门控排除双指滚动的轻拂）
 //   双指按住不动 ≥0.6s     → 连续删除（每 0.1s 一次，移动或抬起即停）
 //
@@ -74,6 +75,10 @@ var bRunStart: Date?
 var bLastThree: Date?
 var lastCount = -1
 var lastBTap = Date.distantPast
+// 四指双击族（4指双击→⌘H）：第一击武装 450ms，第二击触发 ⌘H，超时则补发语音
+var fSeq = 0
+var lastFTap = Date.distantPast
+var lastHideFire = Date.distantPast
 // 双击族2（2指双击→删除）：位移门控排除双指滚动的快速轻拂
 var cClusterStart: Date?
 var cRunStart: Date?
@@ -281,12 +286,32 @@ let callback: MTContactFrameCallback = { device, touches, count, timestamp, fram
         cClusterStart = nil; cRunStart = nil; cLastTwo = nil; cStartPos = nil; cEndPos = nil
 
         // —— 单击族（wantedFingers 指）：双击族未处理时才结算 ——
+        // 第一击武装 450ms：期间第二击 → ⌘H；超时 → 补发语音
         if !bHandled, let t0 = tapStart {
             let dt = now.timeIntervalSince(t0)
             if dt > 0.03 && dt < 0.4 && now.timeIntervalSince(lastFire) > 0.25 {
-                lastFire = now
-                log(String(format: "%d-finger tap (%.0fms) -> post key %d", wantedFingers, dt * 1000, tapKeycode))
-                postQueue.async { postTapKey() }
+                if now.timeIntervalSince(lastFTap) < 0.45 {
+                    fSeq += 1   // 取消挂起的语音
+                    lastFTap = .distantPast
+                    if now.timeIntervalSince(lastHideFire) > 0.3 {
+                        lastHideFire = now
+                        log(String(format: "%d-finger double-tap (%.0fms) -> post ⌘H", wantedFingers, dt * 1000))
+                        postQueue.async { postKey(4, .maskCommand) }
+                    }
+                } else {
+                    fSeq += 1
+                    let seq = fSeq
+                    lastFTap = now
+                    postQueue.asyncAfter(deadline: .now() + 0.45) {
+                        stateLock.lock()
+                        let valid = (seq == fSeq)
+                        stateLock.unlock()
+                        guard valid else { return }
+                        lastFire = Date()
+                        log("4-finger tap confirmed -> voice chord")
+                        postTapKey()
+                    }
+                }
             }
         }
         tapStart = nil
@@ -326,7 +351,7 @@ for (i, dev) in devices.enumerated() {
     let rc = startDev(dev, 0)
     log(String(format: "device %d started rc=%d", i, rc))
 }
-log("tapvoice listening: tap=\(wantedFingers)fingers key=\(tapKeycode), double=\(doubleFingers)fingers key=\(doubleKeycode), 2-finger double -> delete key=\(deleteKeycode)")
+log("tapvoice listening: tap=\(wantedFingers)fingers (450ms arbitration), double=\(doubleFingers)fingers key=\(doubleKeycode), 2-finger double -> delete key=\(deleteKeycode), 4-finger double -> ⌘H")
 log(String(format: "tapFlags=0x%lx", tapFlags.rawValue))
 
 // 启动自检: 合成按键需要辅助功能权限; 没有则弹系统授权框
